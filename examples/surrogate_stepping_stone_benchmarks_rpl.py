@@ -892,7 +892,7 @@ def plot_lambda_trajectories(
         ax.set_title(fname, fontsize=9)
         ax.set_xlabel("Episode")
         ax.set_ylabel("$\\lambda_t$")
-        ax.legend(fontsize=7)
+        ax.legend(fontsize=9)
 
     # Hide unused axes
     for ax_idx in range(n_funcs, n_rows * n_cols):
@@ -937,7 +937,7 @@ def plot_offloading_integral(
     ax.set_xticklabels(func_names, rotation=30, ha="right")
     ax.set_ylabel("Offloading integral $\\int \\lambda_t\\,dt$")
     ax.set_title(f"{benchmark_name}: surrogate quality (higher = less extra work)")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=9)
     fig.tight_layout()
 
     path = os.path.join(output_dir, f"{benchmark_name}_offloading.png")

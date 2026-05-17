@@ -1220,7 +1220,7 @@ def plot_benchmark_pipeline_results(
     ax.set_xticklabels(func_names, rotation=30, ha="right")
     ax.set_title("$R^2$ by surrogate and function")
     ax.set_ylabel("$R^2$")
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=9)
 
     # performance retention per surrogate (mean across functions)
     ax = axes[1]
@@ -1288,7 +1288,7 @@ def plot_gradient_comparison(
                    label=f"threshold={threshold:.2f}")
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
-        ax.legend(fontsize=7)
+        ax.legend(fontsize=9)
 
     fig.tight_layout()
     path = os.path.join(output_dir, "gradient_comparison.png")
@@ -1326,7 +1326,7 @@ def plot_multi_function_heatmap(
         for j in range(len(func_names)):
             v = mat[i, j]
             if np.isfinite(v):
-                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=8)
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=9)
     ax.set_title("Multi-function suite: $R^2$ per (surrogate, function)")
     fig.tight_layout()
     path = os.path.join(output_dir, "multi_function_heatmap.png")
@@ -1471,7 +1471,7 @@ def plot_basis_predictions_1d(
             ax.plot(x0, dec.predict(sur_lines[sur.name]), linewidth=1.5, label=sur.name)
 
         ax.set_ylabel(basis_name, fontsize=9)
-        ax.legend(fontsize=8, loc="upper right", ncol=2)
+        ax.legend(fontsize=9, loc="upper right", ncol=2)
 
     axes[-1, 0].set_xlabel("$x_0$  (with $x_1 = 0$)", fontsize=9)
     fig.suptitle(
