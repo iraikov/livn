@@ -448,7 +448,7 @@ def _build_surrogate_predictions(
 
     y_base_train = dec_sur.predict(Z_sur_train)
     y_base_eval = dec_sur.predict(Z_sur_eval)
-    r2_gt = float(r2_score(y_ev, dec_gt.predict(Z_gt_eval)))
+    r2_gt = float(r2_score(y_eval, dec_gt.predict(Z_gt_eval)))
 
     return y_base_train, y_base_eval, r2_gt
 
@@ -946,6 +946,129 @@ def plot_offloading_integral(
     logger.info("Saved %s", path)
 
 
+def _make_vis_grid(n: int = 40) -> np.ndarray:
+    """Return X_grid (n*n, 2) for a regular grid over [-1, 1]^2."""
+    x = np.linspace(-1.0, 1.0, n)
+    X0, X1 = np.meshgrid(x, x)
+    return np.column_stack([X0.ravel(), X1.ravel()])
+
+
+def plot_residual_field_maps(
+    proxy: BiophysicalModelProxy,
+    surrogates: list,
+    functions: Dict[str, Callable[[np.ndarray], np.ndarray]],
+    n_train: int,
+    seed: int,
+    output_dir: str,
+    filename_prefix: str,
+    suptitle_prefix: str,
+    evaluator: "RPLEvaluator",
+    grid_n: int = 40,
+) -> None:
+    """
+    For each surrogate, save a figure with one row per function and four columns:
+
+      True f(x)  |  Base prediction y_base  |  Initial residual |y - y_base|  |  Final prediction
+
+    'Base prediction' is the surrogate+decoder output before any residual correction.
+    'Initial residual' is the absolute error |y_true - y_base| on the grid, revealing
+    the spatial structure of what the residual MLP must learn.
+    'Final prediction' is the combined output after training the residual MLP for
+    evaluator.n_episodes episodes.
+
+    A good surrogate has a small, structureless initial residual field: the residual
+    only needs to fine-tune.  A poor surrogate has a large, structured field: the
+    residual must re-learn the entire function, and the offloading_integral stays low.
+
+    Surrogates are re-fitted on a fresh training set drawn with `seed`.
+    """
+    rng = np.random.default_rng(seed)
+    X_tr = rng.uniform(-1.0, 1.0, (n_train, 2))
+    Z_gt_tr = proxy.respond(X_tr)
+
+    for sur in surrogates:
+        sur.fit(X_tr, Z_gt_tr)
+
+    X_grid = _make_vis_grid(grid_n)
+
+    col_headers = [
+        "True $f(x)$",
+        "Base prediction $\\hat{y}_{\\mathrm{base}}$",
+        "Initial residual $|y - \\hat{y}_{\\mathrm{base}}|$",
+        "Final prediction $\\hat{y}_{\\mathrm{base}} + r_{\\theta}$",
+    ]
+
+    for sur in surrogates:
+        Z_sur_tr = sur.predict(X_tr)
+        Z_sur_grid = sur.predict(X_grid)
+
+        n_func = len(functions)
+        fig, axes = plt.subplots(
+            n_func, 4,
+            figsize=(4 * 2.8, n_func * 2.5),
+            squeeze=False,
+        )
+
+        for row, (fname, func) in enumerate(functions.items()):
+            y_tr = func(X_tr)
+            y_true_grid = func(X_grid).reshape(grid_n, grid_n)
+
+            dec_sur = Ridge(alpha=1.0).fit(Z_sur_tr, y_tr)
+            y_base_tr = dec_sur.predict(Z_sur_tr)
+            y_base_grid = dec_sur.predict(Z_sur_grid).reshape(grid_n, grid_n)
+
+            residual_init_grid = np.abs(y_true_grid - y_base_grid)
+
+            residual = ResidualPolicy(
+                hidden=evaluator.residual_hidden,
+                iterations_per_episode=evaluator.iterations_per_episode,
+                seed=evaluator.seed,
+            )
+            residuals_tr = y_tr - y_base_tr
+            for _ in range(evaluator.n_episodes):
+                residual.fit_episode(X_tr, residuals_tr)
+            y_final_grid = y_base_grid + residual.predict(X_grid).reshape(grid_n, grid_n)
+
+            vmin = float(y_true_grid.min())
+            vmax = float(y_true_grid.max())
+            panels = [y_true_grid, y_base_grid, residual_init_grid, y_final_grid]
+
+            for col, data in enumerate(panels):
+                ax = axes[row, col]
+                if col == 2:
+                    im = ax.imshow(
+                        data, origin="lower", extent=[-1, 1, -1, 1],
+                        vmin=0.0, vmax=float(residual_init_grid.max()),
+                        cmap="Reds", aspect="auto",
+                    )
+                else:
+                    im = ax.imshow(
+                        data, origin="lower", extent=[-1, 1, -1, 1],
+                        vmin=vmin, vmax=vmax, cmap="RdBu_r", aspect="auto",
+                    )
+                if row == 0:
+                    ax.set_title(col_headers[col], fontsize=9)
+                if col == 0:
+                    ax.set_ylabel(fname, fontsize=9)
+                ax.set_xticks([-1, 0, 1])
+                ax.set_yticks([-1, 0, 1])
+                ax.tick_params(labelsize=7)
+                if col == 3:
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        sur_label = (
+            sur.name.replace(" ", "_")
+            .replace("(", "").replace(")", "")
+            .replace("/", "_")
+        )
+        fig.suptitle(f"{suptitle_prefix} — {sur.name}", fontsize=11)
+        fig.tight_layout()
+        path = os.path.join(output_dir, f"{filename_prefix}_{sur_label}.png")
+        fig.savefig(path, bbox_inches="tight", dpi=120)
+        plt.close(fig)
+        logger.info("Saved %s", path)
+
+
 def save_csv(records: List[RPLRecord], output_dir: str) -> None:
     rows = [
         {
@@ -1052,6 +1175,20 @@ def main() -> None:
         all_records += recs
         plot_lambda_trajectories(recs, "NonlinearApproximationRPL", args.output_dir, args.n_episodes)
         plot_offloading_integral(recs, "NonlinearApproximationRPL", args.output_dir)
+        plot_residual_field_maps(
+            proxy, surrogates, STANDARD_FUNCTIONS,
+            args.n_train, args.seed, args.output_dir,
+            "NonlinearApproximationRPL_standard_residuals",
+            "Nonlinear benchmark (standard): residual field maps",
+            evaluator,
+        )
+        plot_residual_field_maps(
+            proxy, surrogates, ADVERSARIAL_FUNCTIONS,
+            args.n_train, args.seed, args.output_dir,
+            "NonlinearApproximationRPL_adversarial_residuals",
+            "Nonlinear benchmark (adversarial): residual field maps",
+            evaluator,
+        )
 
     if run["multi"]:
         logger.info("=== MultiFunctionSuiteBenchmarkRPL ===")
@@ -1061,6 +1198,13 @@ def main() -> None:
         all_records += recs
         plot_lambda_trajectories(recs, "MultiFunctionSuiteRPL", args.output_dir, args.n_episodes)
         plot_offloading_integral(recs, "MultiFunctionSuiteRPL", args.output_dir)
+        plot_residual_field_maps(
+            proxy, surrogates, STANDARD_FUNCTIONS,
+            args.n_train, args.seed, args.output_dir,
+            "MultiFunctionSuiteRPL_residuals",
+            "Multi-function suite: residual field maps",
+            evaluator,
+        )
 
     save_csv(all_records, args.output_dir)
 

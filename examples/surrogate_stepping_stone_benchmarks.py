@@ -707,6 +707,7 @@ class LinearApproximationBenchmark:
 
     def __init__(self, seed: int = 0) -> None:
         self._rng = np.random.default_rng(seed)
+        self._last_funcs: Dict[str, Callable[[np.ndarray], np.ndarray]] = {}
 
     def _make_functions(self) -> Dict[str, Callable[[np.ndarray], np.ndarray]]:
         funcs = {}
@@ -731,6 +732,7 @@ class LinearApproximationBenchmark:
 
         records: List[BenchmarkRecord] = []
         funcs = self._make_functions()
+        self._last_funcs = funcs
 
         for sur in surrogates:
             t0 = time.perf_counter()
@@ -793,6 +795,7 @@ class BasisFunctionBenchmark:
 
     def __init__(self, seed: int = 0) -> None:
         self._rng = np.random.default_rng(seed)
+        self._last_signals: Dict[str, Callable[[np.ndarray], np.ndarray]] = {}
 
     def _make_basis_functions(
         self,
@@ -846,6 +849,7 @@ class BasisFunctionBenchmark:
         Z_gt_tr = proxy.respond(X_tr)
         Z_gt_te = proxy.respond(X_te)
         basis_funcs = self._make_basis_functions()
+        self._last_signals = {name: sigs[0] for name, sigs in basis_funcs.items()}
 
         records: List[BenchmarkRecord] = []
 
@@ -1331,6 +1335,156 @@ def plot_multi_function_heatmap(
     logger.info("Saved %s", path)
 
 
+def _make_vis_grid(n: int = 40) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (X_grid, X0_mesh, X1_mesh) for a regular n x n grid over [-1, 1]^2."""
+    x = np.linspace(-1.0, 1.0, n)
+    X0, X1 = np.meshgrid(x, x)
+    return np.column_stack([X0.ravel(), X1.ravel()]), X0, X1
+
+
+def plot_function_predictions_2d(
+    proxy: BiophysicalModelProxy,
+    surrogates: List[_BaseModel],
+    functions: Dict[str, Callable[[np.ndarray], np.ndarray]],
+    n_train: int,
+    seed: int,
+    output_dir: str,
+    filename: str,
+    suptitle: str,
+    grid_n: int = 40,
+) -> None:
+    """
+    For each function, plot one row of 2-D color maps:
+      [True f(x)] | [GT decoder] | [surrogate 1 decoder] | [surrogate 2 decoder] ...
+
+    Surrogates are re-fitted on a fresh n_train-point training set drawn with
+    `seed`, independent of bench.run() state.  Each panel shares the color
+    range of the true function so prediction errors appear as hue deviations.
+    """
+    rng = np.random.default_rng(seed)
+    X_tr = rng.uniform(-1.0, 1.0, (n_train, 2))
+    Z_gt_tr = proxy.respond(X_tr)
+
+    for sur in surrogates:
+        sur.fit(X_tr, Z_gt_tr)
+    sur_reps_tr = {sur.name: sur.predict(X_tr) for sur in surrogates}
+
+    X_grid, _, _ = _make_vis_grid(grid_n)
+    Z_gt_grid = proxy.respond(X_grid)
+    sur_grids = {sur.name: sur.predict(X_grid) for sur in surrogates}
+
+    n_func = len(functions)
+    n_cols = 2 + len(surrogates)
+    col_headers = ["True $f(x)$", "GT decoder"] + [s.name for s in surrogates]
+
+    fig, axes = plt.subplots(
+        n_func, n_cols,
+        figsize=(n_cols * 2.8, n_func * 2.5),
+        squeeze=False,
+    )
+
+    for row, (fname, func) in enumerate(functions.items()):
+        y_tr = func(X_tr)
+        y_true = func(X_grid).reshape(grid_n, grid_n)
+
+        dec_gt = Ridge(alpha=1.0).fit(Z_gt_tr, y_tr)
+        y_gt_grid = dec_gt.predict(Z_gt_grid).reshape(grid_n, grid_n)
+
+        sur_pred_grids: Dict[str, np.ndarray] = {}
+        for sur in surrogates:
+            dec = Ridge(alpha=1.0).fit(sur_reps_tr[sur.name], y_tr)
+            sur_pred_grids[sur.name] = dec.predict(sur_grids[sur.name]).reshape(grid_n, grid_n)
+
+        vmin = float(y_true.min())
+        vmax = float(y_true.max())
+        panels = [y_true, y_gt_grid] + [sur_pred_grids[s.name] for s in surrogates]
+
+        for col, data in enumerate(panels):
+            ax = axes[row, col]
+            im = ax.imshow(
+                data, origin="lower", extent=[-1, 1, -1, 1],
+                vmin=vmin, vmax=vmax, cmap="RdBu_r", aspect="auto",
+            )
+            if row == 0:
+                ax.set_title(col_headers[col], fontsize=9)
+            if col == 0:
+                ax.set_ylabel(fname, fontsize=9)
+            ax.set_xticks([-1, 0, 1])
+            ax.set_yticks([-1, 0, 1])
+            ax.tick_params(labelsize=7)
+            if col == n_cols - 1:
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(suptitle, fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(output_dir, filename)
+    fig.savefig(path, bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    logger.info("Saved %s", path)
+
+
+def plot_basis_predictions_1d(
+    proxy: BiophysicalModelProxy,
+    surrogates: List[_BaseModel],
+    basis_signals: Dict[str, Callable[[np.ndarray], np.ndarray]],
+    n_train: int,
+    seed: int,
+    output_dir: str,
+) -> None:
+    """
+    For each basis type, plot a 1-D cross-section (x_1 = 0, x_0 swept over
+    [-1, 1]) showing the true signal, the GT-decoder prediction, and each
+    surrogate-decoder prediction.  Basis functions depend primarily on x_0,
+    so a 1-D slice is more informative than a 2-D color map for this benchmark.
+    """
+    rng = np.random.default_rng(seed)
+    X_tr = rng.uniform(-1.0, 1.0, (n_train, 2))
+    Z_gt_tr = proxy.respond(X_tr)
+
+    for sur in surrogates:
+        sur.fit(X_tr, Z_gt_tr)
+    sur_reps_tr = {sur.name: sur.predict(X_tr) for sur in surrogates}
+
+    x0 = np.linspace(-1.0, 1.0, 300)
+    X_line = np.column_stack([x0, np.zeros_like(x0)])
+    Z_gt_line = proxy.respond(X_line)
+    sur_lines = {sur.name: sur.predict(X_line) for sur in surrogates}
+
+    n_basis = len(basis_signals)
+    fig, axes = plt.subplots(
+        n_basis, 1, figsize=(9, n_basis * 2.5), sharex=True, squeeze=False,
+    )
+
+    for row, (basis_name, func) in enumerate(basis_signals.items()):
+        ax = axes[row, 0]
+        y_tr = func(X_tr)
+        y_line = func(X_line)
+
+        dec_gt = Ridge(alpha=1.0).fit(Z_gt_tr, y_tr)
+        ax.plot(x0, y_line, "k-", linewidth=2, label="True $f(x)$", zorder=4)
+        ax.plot(
+            x0, dec_gt.predict(Z_gt_line),
+            "--", color="gray", linewidth=1.5, label="GT decoder",
+        )
+        for sur in surrogates:
+            dec = Ridge(alpha=1.0).fit(sur_reps_tr[sur.name], y_tr)
+            ax.plot(x0, dec.predict(sur_lines[sur.name]), linewidth=1.5, label=sur.name)
+
+        ax.set_ylabel(basis_name, fontsize=9)
+        ax.legend(fontsize=8, loc="upper right", ncol=2)
+
+    axes[-1, 0].set_xlabel("$x_0$  (with $x_1 = 0$)", fontsize=9)
+    fig.suptitle(
+        "Basis function benchmark: true vs. decoder predictions ($x_1 = 0$ cross-section)",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    path = os.path.join(output_dir, "BasisFunction_predictions_1d.png")
+    fig.savefig(path, bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    logger.info("Saved %s", path)
+
+
 def build_proxy_surrogates(seed: int) -> List[_BaseModel]:
     return [
         LinearProxySurrogate(),
@@ -1413,6 +1567,12 @@ def main() -> None:
         recs = bench.run(proxy, surrogates, args.n_train)
         all_records += recs
         plot_benchmark_pipeline_results(recs, "LinearApproximation", args.output_dir)
+        plot_function_predictions_2d(
+            proxy, surrogates, bench._last_funcs,
+            args.n_train, args.seed, args.output_dir,
+            "LinearApproximation_predictions.png",
+            "Linear approximation: ground truth vs. decoder predictions",
+        )
 
     if run["basis"]:
         logger.info("=== BasisFunctionBenchmark ===")
@@ -1420,6 +1580,10 @@ def main() -> None:
         recs = bench.run(proxy, surrogates, args.n_train)
         all_records += recs
         plot_benchmark_pipeline_results(recs, "BasisFunction", args.output_dir)
+        plot_basis_predictions_1d(
+            proxy, surrogates, bench._last_signals,
+            args.n_train, args.seed, args.output_dir,
+        )
 
     if run["nonlinear"]:
         logger.info("=== NonlinearApproximationBenchmark ===")
@@ -1432,6 +1596,18 @@ def main() -> None:
             args.output_dir,
         )
         plot_gradient_comparison(recs, args.output_dir)
+        plot_function_predictions_2d(
+            proxy, surrogates, STANDARD_FUNCTIONS,
+            args.n_train, args.seed, args.output_dir,
+            "NonlinearApproximation_standard_predictions.png",
+            "Nonlinear benchmark (standard): ground truth vs. decoder predictions",
+        )
+        plot_function_predictions_2d(
+            proxy, surrogates, ADVERSARIAL_FUNCTIONS,
+            args.n_train, args.seed, args.output_dir,
+            "NonlinearApproximation_adversarial_predictions.png",
+            "Nonlinear benchmark (adversarial): ground truth vs. decoder predictions",
+        )
 
     if run["multi"]:
         logger.info("=== MultiFunctionSuiteBenchmark ===")
@@ -1439,6 +1615,12 @@ def main() -> None:
         recs = bench.run(proxy, surrogates, args.n_train)
         all_records += recs
         plot_multi_function_heatmap(recs, args.output_dir)
+        plot_function_predictions_2d(
+            proxy, surrogates, STANDARD_FUNCTIONS,
+            args.n_train, args.seed, args.output_dir,
+            "MultiFunctionSuite_predictions.png",
+            "Multi-function suite: ground truth vs. decoder predictions",
+        )
 
     save_csv(all_records, args.output_dir)
 
